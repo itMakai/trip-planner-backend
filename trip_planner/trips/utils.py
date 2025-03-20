@@ -1,38 +1,47 @@
 import requests
+import logging
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.pdfgen import canvas
 from io import BytesIO
+from datetime import datetime
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 class GeocodingError(Exception):
-    """Raised when geocoding fails."""
     pass
 
 class RoutingError(Exception):
-    """Raised when route calculation fails."""
     pass
 
 class PdfGenerationError(Exception):
-    """Raised when PDF generation fails."""
     pass
 
 def geocode_nominatim(location):
     url = f"https://nominatim.openstreetmap.org/search?q={location}&format=json&limit=1"
     headers = {"User-Agent": "TripPlanner/1.0"}
     try:
+        logger.debug(f"Geocoding location: {location}")
         response = requests.get(url, headers=headers, timeout=5)
-        response.raise_for_status()  # Raise an HTTPError for bad responses
+        response.raise_for_status()
         data = response.json()
         if not data:
-            raise GeocodingError(f"No geocoding results for location: {location}")
-        return [float(data[0]["lon"]), float(data[0]["lat"])]
+            logger.warning(f"No geocoding results for location: {location}")
+            return None
+        coords = [float(data[0]["lon"]), float(data[0]["lat"])]
+        logger.debug(f"Geocoded {location} to {coords}")
+        return coords
     except (requests.RequestException, ValueError) as e:
-        raise GeocodingError(f"Failed to geocode {location}: {str(e)}")
+        logger.error(f"Failed to geocode {location}: {str(e)}")
+        return None
 
 def get_osrm_route(coords):
-    url = f"http://router.project-osrm.org/route/v1/driving/{coords['current'][0]},{coords['current'][1]};{coords['pickup'][0]},{coords['pickup'][1]};{coords['dropoff'][0]},{coords['dropoff'][1]}?overview=full&geometries=geojson"
+    url = f"http://router.project-osrm.org/route/v1/driving/{coords['current'][0]},{coords['current'][1]};{coords['pickup'][0]},{coords['pickup'][1]};{coords['dropoff'][0]},{coords['dropoff'][1]}?overview=simplified&geometries=geojson"
     try:
+        logger.debug(f"Fetching route for coords: {coords}")
         response = requests.get(url, timeout=5)
         response.raise_for_status()
         data = response.json()
@@ -41,14 +50,15 @@ def get_osrm_route(coords):
         distance = data["routes"][0]["distance"] / 1609.34
         duration = data["routes"][0]["duration"] / 3600
         coordinates = data["routes"][0]["geometry"]["coordinates"]
+        logger.debug(f"Route fetched with {len(coordinates)} coordinates")
         return {
             "distance_miles": distance,
             "duration_hours": duration,
             "coordinates": coordinates
         }
     except (requests.RequestException, KeyError, ValueError) as e:
+        logger.error(f"Failed to calculate route: {str(e)}")
         raise RoutingError(f"Failed to calculate route: {str(e)}")
-
 def generate_eld_logs(route_data, cycle_hours_used):
     try:
         total_distance = route_data["distance_miles"]
@@ -63,30 +73,66 @@ def generate_eld_logs(route_data, cycle_hours_used):
             raise ValueError("No remaining hours in cycle to complete trip")
         
         while remaining_miles > 0 and remaining_hours > 0:
-            daily_log = {"day": current_day + 1, "entries": []}
+            daily_log = {"day": current_day + 1, "activities": []}
             
+            # Start at 00:00 each day
+            current_time = 0.0  # In hours (0.0 = 00:00)
+            
+            # Pickup (1 hour on Day 1)
+            if current_day == 0:
+                daily_log["activities"].append({
+                    "type": "pickup",
+                    "start": current_time,
+                    "end": current_time + 1.0
+                })
+                current_time += 1.0
+            
+            # Calculate driving and breaks
             daily_driving_hours = min(11, remaining_hours, remaining_miles / 60)
+            daily_driving_hours = round(daily_driving_hours, 1)
             daily_miles = daily_driving_hours * 60
+            daily_miles = round(daily_miles, 1)
             
             on_duty_hours = daily_driving_hours
-            if current_day == 0:
-                on_duty_hours += 1
-            if remaining_miles - daily_miles <= 0:
-                on_duty_hours += 1
             
-            fuel_stops = int(daily_miles / 1000)
-            if fuel_stops > 0:
-                daily_log["entries"].append({"type": "fuel", "count": fuel_stops})
-            
-            if daily_driving_hours > 8:
-                daily_log["entries"].append({"type": "break", "duration": 0.5})
-                on_duty_hours += 0.5
-            
-            daily_log["entries"].append({
+            # Driving period
+            daily_log["activities"].append({
                 "type": "driving",
-                "hours": daily_driving_hours,
+                "start": current_time,
+                "end": current_time + daily_driving_hours,
                 "miles": daily_miles
             })
+            current_time += daily_driving_hours
+            
+            # Break (0.5 hours if driving > 8 hours)
+            if daily_driving_hours > 8:
+                daily_log["activities"].append({
+                    "type": "break",
+                    "start": current_time,
+                    "end": current_time + 0.5
+                })
+                current_time += 0.5
+                on_duty_hours += 0.5
+            
+            # Fuel stops (approximate timing, assume 15 minutes per stop)
+            fuel_stops = int(daily_miles / 1000)
+            for _ in range(fuel_stops):
+                daily_log["activities"].append({
+                    "type": "fuel",
+                    "start": current_time,
+                    "end": current_time + 0.25  # 15 minutes
+                })
+                current_time += 0.25
+            
+            # Dropoff (1 hour on last day)
+            if remaining_miles - daily_miles <= 0:
+                daily_log["activities"].append({
+                    "type": "dropoff",
+                    "start": current_time,
+                    "end": current_time + 1.0
+                })
+                current_time += 1.0
+                on_duty_hours += 1.0
             
             logs.append(daily_log)
             remaining_miles -= daily_miles
@@ -98,57 +144,166 @@ def generate_eld_logs(route_data, cycle_hours_used):
         
         return logs
     except KeyError as e:
+        logger.error(f"Invalid route data: missing {str(e)}")
         raise ValueError(f"Invalid route data: missing {str(e)}")
     except Exception as e:
+        logger.error(f"Error generating ELD logs: {str(e)}")
         raise ValueError(f"Error generating ELD logs: {str(e)}")
-
+    
+    
 def generate_eld_pdf(trip, eld_logs):
     try:
         buffer = BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=70, bottomMargin=50, leftMargin=50, rightMargin=50)
         elements = []
         
         styles = getSampleStyleSheet()
-        header = Paragraph(f"ELD Logs for Trip {trip.id}", styles['Title'])
-        elements.append(header)
-        elements.append(Paragraph(f"From: {trip.current_location} to {trip.dropoff_location}", styles['Normal']))
-        elements.append(Paragraph(f"Cycle Hours Used: {trip.cycle_hours_used}", styles['Normal']))
-        elements.append(Paragraph("<br/><br/>", styles['Normal']))
         
+        # Colors for activities
+        colors_dict = {
+            'pickup': colors.Color(1, 0.39, 0.28),  # Tomato
+            'driving': colors.Color(1, 0.84, 0),     # Gold
+            'break': colors.Color(0.27, 0.51, 0.71), # SteelBlue
+            'fuel': colors.Color(0.2, 0.8, 0.2),     # LimeGreen
+            'dropoff': colors.Color(1, 0.27, 0)      # OrangeRed
+        }
+
+        # Header and footer
+        def draw_header(canvas, doc):
+            canvas.saveState()
+            canvas.setFont('Helvetica-Bold', 16)
+            canvas.drawCentredString(letter[0] / 2, letter[1] - 40, f"ELD Logs for Trip {trip.id}")
+            canvas.setFont('Helvetica', 10)
+            canvas.drawString(50, letter[1] - 60, f"From: {trip.current_location} | Pickup: {trip.pickup_location} | To: {trip.dropoff_location}")
+            canvas.drawString(50, letter[1] - 75, f"Cycle Hours Used: {trip.cycle_hours_used}")
+            canvas.line(50, letter[1] - 80, letter[0] - 50, letter[1] - 80)
+            canvas.restoreState()
+
+        def draw_footer(canvas, doc):
+            canvas.saveState()
+            canvas.setFont('Helvetica', 8)
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            canvas.drawString(50, 30, f"Generated on: {timestamp}")
+            page_num = f"Page {doc.page}"
+            canvas.drawRightString(letter[0] - 50, 30, page_num)
+            canvas.line(50, 40, letter[0] - 50, 40)
+            canvas.restoreState()
+
+        # Draw each day's log as a graphical timeline
         for log in eld_logs:
             elements.append(Paragraph(f"Day {log['day']}", styles['Heading2']))
-            data = [["Activity", "Details"]]
-            for entry in log["entries"]:
-                if entry["type"] == "driving":
-                    data.append(["Driving", f"{entry['hours']} hrs, {entry['miles']} miles"])
-                elif entry["type"] == "break":
-                    data.append(["Break", f"{entry['duration']} hrs"])
-                elif entry["type"] == "fuel":
-                    data.append(["Fuel Stops", f"{entry['count']}"])
-            if log["day"] == 1:
-                data.append(["Pickup", "1 hr"])
-            if log["day"] == len(eld_logs):
-                data.append(["Dropoff", "1 hr"])
-            
-            table = Table(data, colWidths=[150, 300])
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 12),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
-                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 1), (-1, -1), 10),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('ALIGN', (1, 1), (1, -1), 'LEFT'),
-            ]))
-            elements.append(table)
-            elements.append(Paragraph("<br/>", styles['Normal']))
-        
-        doc.build(elements)
+            elements.append(Spacer(1, 20))
+
+            # Create a canvas for drawing the timeline
+            width = 450
+            height = 200  # Reduced height
+            label_width = 70
+            timeline_width = width - label_width
+            pixels_per_hour = timeline_width / 24
+            row_height = 30  # Reduced for compactness
+            activity_types = ['pickup', 'driving', 'break', 'fuel', 'dropoff']
+
+            from reportlab.graphics.shapes import Drawing, Line, String, PolyLine
+            from reportlab.graphics import renderPDF
+
+            d = Drawing(width, height)
+
+            # Draw labels on the left (Pickup at the top)
+            for i, type in enumerate(activity_types):
+                y = 50 + (len(activity_types) - 1 - i) * row_height + row_height / 2  # Reverse the row order
+                d.add(String(5, y, type.capitalize(), fontName='Helvetica', fontSize=10))
+
+            # Draw timeline at the top
+            for hour in range(25):
+                x = label_width + hour * pixels_per_hour
+                d.add(String(x, 35, str(hour), fontName='Helvetica', fontSize=8, textAnchor='middle'))
+                for half in range(2):
+                    x_half = x + half * (pixels_per_hour / 2)
+                    d.add(Line(x_half, 40, x_half, 50, strokeColor=colors.black, strokeWidth=1))
+                for third in range(3):
+                    x_third = x + third * (pixels_per_hour / 3)
+                    if third == 0 or third == 1.5: continue
+                    d.add(Line(x_third, 45, x_third, 50, strokeColor=colors.black, strokeWidth=0.5))
+
+            # Draw grid
+            for hour in range(25):
+                x = label_width + hour * pixels_per_hour
+                d.add(Line(x, 50, x, 50 + len(activity_types) * row_height, strokeColor=colors.black, strokeWidth=0.5))
+            for i in range(len(activity_types) + 1):
+                y = 50 + i * row_height
+                d.add(Line(label_width, y, width, y, strokeColor=colors.black, strokeWidth=0.5))
+
+            # Draw small sticks in each row
+            for row_index in range(len(activity_types)):
+                y_base = 50 + row_index * row_height
+                for hour in range(25):
+                    x = label_width + hour * pixels_per_hour
+                    for half in range(2):
+                        x_half = x + half * (pixels_per_hour / 2)
+                        d.add(Line(x_half, y_base + row_height - 10, x_half, y_base + row_height, strokeColor=colors.black, strokeWidth=1))
+                    for third in range(3):
+                        x_third = x + third * (pixels_per_hour / 3)
+                        if third == 0 or third == 1.5: continue
+                        d.add(Line(x_third, y_base + row_height - 5, x_third, y_base + row_height, strokeColor=colors.black, strokeWidth=0.5))
+
+            # Draw activities and transition lines
+            last_activity = None
+            for activity in log['activities'] or []:
+                row_index = activity_types.index(activity['type'])
+                if row_index == -1: continue
+
+                # Reverse the row index for correct positioning (Pickup at the top)
+                adjusted_row_index = len(activity_types) - 1 - row_index
+                start_x = label_width + activity['start'] * pixels_per_hour
+                end_x = label_width + activity['end'] * pixels_per_hour
+                y = 50 + adjusted_row_index * row_height + row_height / 2 - 5
+
+                # Activity line
+                d.add(Line(start_x, y, end_x, y, strokeColor=colors_dict.get(activity['type'], colors.gray), strokeWidth=8))
+
+                # Transition line between different activities
+                if last_activity and last_activity['type'] != activity['type']:
+                    prev_end_x = label_width + last_activity['end'] * pixels_per_hour
+                    prev_row_index = len(activity_types) - 1 - activity_types.index(last_activity['type'])
+                    prev_y = 50 + prev_row_index * row_height + row_height / 2 - 5
+                    points = [
+                        prev_end_x, prev_y,
+                        prev_end_x, prev_y + (y - prev_y) / 2,
+                        start_x, prev_y + (y - prev_y) / 2,
+                        start_x, y
+                    ]
+                    d.add(PolyLine(points, strokeColor=colors_dict.get(last_activity['type'], colors.gray), strokeWidth=2))
+                # Transition line within the same activity type
+                elif last_activity and last_activity['type'] == activity['type']:
+                    prev_end_x = label_width + last_activity['end'] * pixels_per_hour
+                    points = [
+                        prev_end_x, y - row_height / 4,
+                        prev_end_x, y + row_height / 4,
+                        start_x, y + row_height / 4,
+                        start_x, y - row_height / 4,
+                        prev_end_x, y - row_height / 4
+                    ]
+                    d.add(PolyLine(points, strokeColor=colors_dict.get(activity['type'], colors.gray), strokeWidth=1))
+
+                last_activity = activity
+
+                # Start and end times
+                start_time = f"{int(activity['start']):02d}:{int((activity['start'] % 1) * 60):02d}"
+                end_time = f"{int(activity['end']):02d}:{int((activity['end'] % 1) * 60):02d}"
+                d.add(String(start_x + 2, y - 5, start_time, fontName='Helvetica', fontSize=8))
+                d.add(String(end_x - 30, y - 5, end_time, fontName='Helvetica', fontSize=8))
+
+                # Miles for driving
+                if activity['type'] == 'driving':
+                    d.add(String((start_x + end_x) / 2, y - 5, f"{activity['miles']} miles", fontName='Helvetica', fontSize=8, textAnchor='middle'))
+
+            elements.append(d)
+            elements.append(Spacer(1, 30))
+
+        # Build the PDF
+        doc.build(elements, onFirstPage=lambda c, d: (draw_header(c, d), draw_footer(c, d)), 
+                  onLaterPages=lambda c, d: (draw_header(c, d), draw_footer(c, d)))
+
         pdf_content = buffer.getvalue()
         buffer.close()
         return pdf_content
