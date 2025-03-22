@@ -59,24 +59,31 @@ def get_osrm_route(coords):
     except (requests.RequestException, KeyError, ValueError) as e:
         logger.error(f"Failed to calculate route: {str(e)}")
         raise RoutingError(f"Failed to calculate route: {str(e)}")
+    
 def generate_eld_logs(route_data, cycle_hours_used):
+    """Generate ELD logs for the trip."""
     try:
         total_distance = route_data["distance_miles"]
-        total_hours = route_data["duration_hours"] + 2
+        total_hours = route_data["duration_hours"] + 2  # 1 hour for pickup + 1 hour for dropoff
         
         logs = []
-        remaining_hours = 70 - cycle_hours_used
+        remaining_hours = 70 - cycle_hours_used  # 70-hour cycle limit
         remaining_miles = total_distance
         current_day = 0
+        max_iterations = 100  # Prevent infinite loops
         
         if remaining_hours <= 0:
             raise ValueError("No remaining hours in cycle to complete trip")
         
-        while remaining_miles > 0 and remaining_hours > 0:
-            daily_log = {"day": current_day + 1, "activities": []}
+        logger.debug(f"Starting ELD log generation: total_distance={total_distance}, cycle_hours_used={cycle_hours_used}, remaining_hours={remaining_hours}")
+        
+        while remaining_miles > 0.01 and remaining_hours > 0:
+            if current_day >= max_iterations:
+                raise ValueError(f"Too many days required (>{max_iterations}), check cycle hours or route data")
             
-            # Start at 00:00 each day
-            current_time = 0.0  # In hours (0.0 = 00:00)
+            daily_log = {"day": current_day + 1, "activities": []}
+            current_time = 8.0  # Start at 08:00 each day
+            on_duty_hours = 0.0  # Track total on-duty hours for the day
             
             # Pickup (1 hour on Day 1)
             if current_day == 0:
@@ -86,26 +93,31 @@ def generate_eld_logs(route_data, cycle_hours_used):
                     "end": current_time + 1.0
                 })
                 current_time += 1.0
+                on_duty_hours += 1.0
             
-            # Calculate driving and breaks
-            daily_driving_hours = min(11, remaining_hours, remaining_miles / 60)
-            daily_driving_hours = round(daily_driving_hours, 1)
-            daily_miles = daily_driving_hours * 60
-            daily_miles = round(daily_miles, 1)
+            # Calculate daily driving
+            daily_driving_hours = min(11, remaining_hours - on_duty_hours, remaining_miles / 60)  # 60 mph average
+            daily_driving_hours = max(round(daily_driving_hours, 1), 0.1) if remaining_miles > 0 else 0
+            daily_miles = round(daily_driving_hours * 60, 1)
             
-            on_duty_hours = daily_driving_hours
+            # Adjust if remaining_miles is less than calculated daily_miles
+            if daily_miles > remaining_miles:
+                daily_miles = remaining_miles
+                daily_driving_hours = daily_miles / 60
             
             # Driving period
-            daily_log["activities"].append({
-                "type": "driving",
-                "start": current_time,
-                "end": current_time + daily_driving_hours,
-                "miles": daily_miles
-            })
-            current_time += daily_driving_hours
+            if daily_driving_hours > 0:
+                daily_log["activities"].append({
+                    "type": "driving",
+                    "start": current_time,
+                    "end": current_time + daily_driving_hours,
+                    "miles": daily_miles
+                })
+                current_time += daily_driving_hours
+                on_duty_hours += daily_driving_hours
             
             # Break (0.5 hours if driving > 8 hours)
-            if daily_driving_hours > 8:
+            if daily_driving_hours > 8 and remaining_hours - on_duty_hours >= 0.5:
                 daily_log["activities"].append({
                     "type": "break",
                     "start": current_time,
@@ -114,18 +126,21 @@ def generate_eld_logs(route_data, cycle_hours_used):
                 current_time += 0.5
                 on_duty_hours += 0.5
             
-            # Fuel stops (approximate timing, assume 15 minutes per stop)
-            fuel_stops = int(daily_miles / 1000)
-            for _ in range(fuel_stops):
-                daily_log["activities"].append({
-                    "type": "fuel",
-                    "start": current_time,
-                    "end": current_time + 0.25  # 15 minutes
-                })
-                current_time += 0.25
+            # Fuel stops (15 minutes per 1000 miles, only if driving occurred)
+            if daily_miles > 0:
+                fuel_stops = int(daily_miles / 1000)
+                for _ in range(fuel_stops):
+                    if remaining_hours - on_duty_hours >= 0.25:
+                        daily_log["activities"].append({
+                            "type": "fuel",
+                            "start": current_time,
+                            "end": current_time + 0.25
+                        })
+                        current_time += 0.25
+                        on_duty_hours += 0.25
             
-            # Dropoff (1 hour on last day)
-            if remaining_miles - daily_miles <= 0:
+            # Dropoff (1 hour on the last day)
+            if remaining_miles - daily_miles <= 0.01 and remaining_hours - on_duty_hours >= 1.0:
                 daily_log["activities"].append({
                     "type": "dropoff",
                     "start": current_time,
@@ -133,23 +148,35 @@ def generate_eld_logs(route_data, cycle_hours_used):
                 })
                 current_time += 1.0
                 on_duty_hours += 1.0
+                remaining_miles = 0  # Mark trip as complete
             
-            logs.append(daily_log)
-            remaining_miles -= daily_miles
+            # Append log only if it has activities
+            if daily_log["activities"]:
+                logs.append(daily_log)
+            
+            # Update remaining values
+            remaining_miles = max(remaining_miles - daily_miles, 0)  # Avoid negative values
             remaining_hours -= on_duty_hours
             current_day += 1
+            
+            logger.debug(f"Day {current_day}: daily_miles={daily_miles}, remaining_miles={remaining_miles}, on_duty_hours={on_duty_hours}, remaining_hours={remaining_hours}")
         
-        if remaining_miles > 0:
+        if remaining_miles > 0.01:
             raise ValueError("Trip exceeds available cycle hours")
         
+        # Renumber days
+        for i, log in enumerate(logs):
+            log["day"] = i + 1
+        
+        logger.debug(f"ELD log generation completed: {len(logs)} days")
         return logs
+    
     except KeyError as e:
         logger.error(f"Invalid route data: missing {str(e)}")
         raise ValueError(f"Invalid route data: missing {str(e)}")
     except Exception as e:
         logger.error(f"Error generating ELD logs: {str(e)}")
         raise ValueError(f"Error generating ELD logs: {str(e)}")
-    
     
 def generate_eld_pdf(trip, eld_logs):
     try:
