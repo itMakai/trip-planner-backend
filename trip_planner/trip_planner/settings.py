@@ -63,7 +63,8 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "https://trip-ead7jmlg0-daniel-makais-projects.vercel.app",
     "https://trip-planner-ead7jmlg0-daniel-makais-projects.vercel.app",
-    "https://trip-planner-psi-two.vercel.app",  # Add this line
+    "https://trip-planner-psi-two.vercel.app",
+    "https://eld-log-generator.vercel.app"  
 ]
 # CORS_ALLOW_ALL_ORIGINS = True
 
