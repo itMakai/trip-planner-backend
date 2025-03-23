@@ -66,7 +66,7 @@ CORS_ALLOWED_ORIGINS = [
     "https://trip-planner-psi-two.vercel.app",
     "https://eld-log-generator.vercel.app"  
 ]
-# CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = True
 
 TEMPLATES = [
     {
