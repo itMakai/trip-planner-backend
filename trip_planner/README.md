@@ -44,5 +44,5 @@ This is the backend application for the **Trip Planner** project. It provides AP
 ### **Installation**
 1. Clone the repository:
    ```bash
-   git clone https://itmakai/your-username/trip-planner-backend.git
+   git clone https://itmakai/trip-planner-backend.git
    cd trip-planner-backend
